@@ -33,6 +33,13 @@ import re
 import PyPDF2
 import asyncio
 import edge_tts
+import sqlite3
+import hashlib
+try:
+    import bcrypt
+    BCRYPT_AVAILABLE = True
+except ImportError:
+    BCRYPT_AVAILABLE = False
 from nutrition_rag import (
     nutrition_document_uploader, 
     enhance_prompt_with_rag, 
@@ -64,6 +71,519 @@ HEYGEN_AVAILABLE = True  # HeyGen embed always available via JavaScript
 
 # Load environment variables
 load_dotenv()
+
+# Database setup and authentication functions
+def init_database():
+    """Initialize SQLite database for user authentication and profiles"""
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    
+    # Users table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            hashed_password TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # User profiles table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS user_profiles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            age INTEGER,
+            gender TEXT,
+            weight REAL,
+            height REAL,
+            activity_level TEXT,
+            goal TEXT,
+            goal_duration INTEGER,
+            selected_allergies TEXT,
+            custom_allergies TEXT,
+            food_restrictions TEXT,
+            health_issues TEXT,
+            is_picky_eater TEXT,
+            disliked_foods TEXT,
+            profile_complete BOOLEAN DEFAULT FALSE,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+    
+    # Knowledge base documents table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS user_documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            document_name TEXT NOT NULL,
+            document_type TEXT,
+            document_content TEXT,
+            document_chunks TEXT,
+            document_size INTEGER,
+            uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+    
+    # Chat history table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS user_chat_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            user_message TEXT NOT NULL,
+            ai_response TEXT NOT NULL,
+            persona_used TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+    
+    # Meal logging table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS user_meal_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            meal_description TEXT NOT NULL,
+            meal_type TEXT,
+            calories REAL,
+            protein REAL,
+            carbs REAL,
+            fat REAL,
+            logged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+    
+    # Run database migrations
+    migrate_database()
+
+def migrate_database():
+    """Run database migrations to update existing database structure"""
+    try:
+        conn = sqlite3.connect('users.db')
+        cursor = conn.cursor()
+        
+        # Check if goal_duration column exists
+        cursor.execute("PRAGMA table_info(user_profiles)")
+        columns = [column[1] for column in cursor.fetchall()]
+        
+        if 'goal_duration' not in columns:
+            # Add goal_duration column
+            cursor.execute('ALTER TABLE user_profiles ADD COLUMN goal_duration INTEGER DEFAULT 4')
+            conn.commit()
+        
+        # Update old activity level values to new format
+        cursor.execute('''
+            UPDATE user_profiles 
+            SET activity_level = CASE 
+                WHEN activity_level = 'Sedentary' THEN 'Inactive'
+                WHEN activity_level = 'Lightly Active' THEN 'Light'
+                WHEN activity_level = 'Moderately Active' THEN 'Moderate'
+                WHEN activity_level = 'Very Active' THEN 'Very Active'
+                WHEN activity_level = 'Extremely Active' THEN 'Very Active'
+                ELSE activity_level
+            END
+        ''')
+        
+        # Update old goal values to new format
+        cursor.execute('''
+            UPDATE user_profiles 
+            SET goal = CASE 
+                WHEN goal = 'Weight Loss' THEN 'Lose Weight'
+                WHEN goal = 'Weight Gain' THEN 'Gain Weight'
+                WHEN goal = 'Muscle Building' THEN 'Build Muscle'
+                WHEN goal = 'General Health' THEN 'Maintain'
+                WHEN goal = 'Athletic Performance' THEN 'Build Muscle'
+                ELSE goal
+            END
+        ''')
+        
+        conn.commit()
+        conn.close()
+        
+    except Exception as e:
+        # If migration fails, ignore silently to avoid breaking the app
+        pass
+
+def hash_password(password: str) -> str:
+    """Hash password using bcrypt or fallback to hashlib"""
+    if BCRYPT_AVAILABLE:
+        salt = bcrypt.gensalt()
+        return bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
+    else:
+        # Fallback to hashlib with salt (less secure but functional)
+        import secrets
+        salt = secrets.token_hex(16)
+        return hashlib.sha256((password + salt).encode('utf-8')).hexdigest() + ':' + salt
+
+def verify_password(password: str, hashed: str) -> bool:
+    """Verify password against hash"""
+    if BCRYPT_AVAILABLE:
+        return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
+    else:
+        # Fallback verification for hashlib
+        if ':' in hashed:
+            password_hash, salt = hashed.split(':')
+            return hashlib.sha256((password + salt).encode('utf-8')).hexdigest() == password_hash
+        return False
+
+def create_user(name: str, email: str, password: str) -> tuple[bool, str]:
+    """Create new user account"""
+    try:
+        conn = sqlite3.connect('users.db')
+        cursor = conn.cursor()
+        
+        # Check if email already exists
+        cursor.execute('SELECT id FROM users WHERE email = ?', (email,))
+        if cursor.fetchone():
+            conn.close()
+            return False, "Email already exists"
+        
+        # Hash password and create user
+        hashed_pw = hash_password(password)
+        cursor.execute(
+            'INSERT INTO users (name, email, hashed_password) VALUES (?, ?, ?)',
+            (name, email, hashed_pw)
+        )
+        
+        conn.commit()
+        user_id = cursor.lastrowid
+        conn.close()
+        return True, f"User created successfully with ID: {user_id}"
+        
+    except Exception as e:
+        return False, f"Error creating user: {str(e)}"
+
+def authenticate_user(email: str, password: str) -> tuple[bool, dict]:
+    """Authenticate user login"""
+    try:
+        conn = sqlite3.connect('users.db')
+        cursor = conn.cursor()
+        
+        cursor.execute(
+            'SELECT id, name, email, hashed_password FROM users WHERE email = ?',
+            (email,)
+        )
+        user = cursor.fetchone()
+        conn.close()
+        
+        if user and verify_password(password, user[3]):
+            return True, {
+                'id': user[0],
+                'name': user[1],
+                'email': user[2]
+            }
+        else:
+            return False, {}
+            
+    except Exception as e:
+        return False, {}
+
+def is_user_logged_in() -> bool:
+    """Check if user is currently logged in"""
+    return 'user_id' in st.session_state and st.session_state.user_id is not None
+
+def save_user_profile(user_id: int, profile_data: dict) -> bool:
+    """Save user profile to database"""
+    try:
+        conn = sqlite3.connect('users.db')
+        cursor = conn.cursor()
+        
+        # Convert selected_allergies list to JSON string
+        selected_allergies_json = json.dumps(profile_data.get('selected_allergies', []))
+        
+        # Check if profile exists
+        cursor.execute('SELECT id FROM user_profiles WHERE user_id = ?', (user_id,))
+        existing_profile = cursor.fetchone()
+        
+        if existing_profile:
+            # Update existing profile
+            cursor.execute('''
+                UPDATE user_profiles SET
+                    age = ?, gender = ?, weight = ?, height = ?, activity_level = ?,
+                    goal = ?, goal_duration = ?, selected_allergies = ?, custom_allergies = ?, 
+                    food_restrictions = ?, health_issues = ?, is_picky_eater = ?,
+                    disliked_foods = ?, profile_complete = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE user_id = ?
+            ''', (
+                profile_data.get('age'), profile_data.get('gender'),
+                profile_data.get('weight'), profile_data.get('height'),
+                profile_data.get('activity_level'), profile_data.get('goal'),
+                profile_data.get('goal_duration'), selected_allergies_json, 
+                profile_data.get('custom_allergies'), profile_data.get('food_restrictions'), 
+                profile_data.get('health_issues'), profile_data.get('is_picky_eater'), 
+                profile_data.get('disliked_foods'), True, user_id
+            ))
+        else:
+            # Insert new profile
+            cursor.execute('''
+                INSERT INTO user_profiles (
+                    user_id, age, gender, weight, height, activity_level, goal, goal_duration,
+                    selected_allergies, custom_allergies, food_restrictions,
+                    health_issues, is_picky_eater, disliked_foods, profile_complete
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                user_id, profile_data.get('age'), profile_data.get('gender'),
+                profile_data.get('weight'), profile_data.get('height'),
+                profile_data.get('activity_level'), profile_data.get('goal'),
+                profile_data.get('goal_duration'), selected_allergies_json, 
+                profile_data.get('custom_allergies'), profile_data.get('food_restrictions'), 
+                profile_data.get('health_issues'), profile_data.get('is_picky_eater'), 
+                profile_data.get('disliked_foods'), True
+            ))
+        
+        conn.commit()
+        conn.close()
+        return True
+        
+    except Exception as e:
+        # Log the error for debugging
+        print(f"Database error in save_user_profile: {str(e)}")
+        return False
+
+def load_user_profile(user_id: int) -> dict:
+    """Load user profile from database"""
+    try:
+        conn = sqlite3.connect('users.db')
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT age, gender, weight, height, activity_level, goal, goal_duration,
+                   selected_allergies, custom_allergies, food_restrictions,
+                   health_issues, is_picky_eater, disliked_foods, profile_complete
+            FROM user_profiles WHERE user_id = ?
+        ''', (user_id,))
+        
+        profile_row = cursor.fetchone()
+        conn.close()
+        
+        if profile_row:
+            # Parse selected_allergies JSON
+            selected_allergies = json.loads(profile_row[7]) if profile_row[7] else []
+            
+            return {
+                'age': profile_row[0] or 25,
+                'gender': profile_row[1] or 'Female',
+                'weight': profile_row[2] or 65.0,
+                'height': profile_row[3] or 165.0,
+                'activity_level': profile_row[4] or 'Moderate',
+                'goal': profile_row[5] or 'Maintain',
+                'goal_duration': profile_row[6] or 4,
+                'selected_allergies': selected_allergies,
+                'custom_allergies': profile_row[8] or '',
+                'food_restrictions': profile_row[9] or '',
+                'health_issues': profile_row[10] or '',
+                'is_picky_eater': profile_row[11] or 'No',
+                'disliked_foods': profile_row[12] or '',
+                'profile_complete': bool(profile_row[13])
+            }
+        else:
+            # Return default profile if none exists
+            return {
+                'age': 25,
+                'gender': 'Female',
+                'weight': 65.0,
+                'height': 165.0,
+                'activity_level': 'Moderate',
+                'goal': 'Maintain',
+                'goal_duration': 4,
+                'selected_allergies': [],
+                'custom_allergies': '',
+                'food_restrictions': '',
+                'health_issues': '',
+                'is_picky_eater': 'No',
+                'disliked_foods': '',
+                'profile_complete': False
+            }
+            
+    except Exception as e:
+        # Return default profile on error
+        return {
+            'age': 25,
+            'gender': 'Female',
+            'weight': 65.0,
+            'height': 165.0,
+            'activity_level': 'Moderate',
+            'goal': 'Maintain',
+            'goal_duration': 4,
+            'selected_allergies': [],
+            'custom_allergies': '',
+            'food_restrictions': '',
+            'health_issues': '',
+            'is_picky_eater': 'No',
+            'disliked_foods': '',
+            'profile_complete': False
+        }
+
+def save_user_document(user_id: int, document_data: dict) -> bool:
+    """Save user document to database"""
+    try:
+        conn = sqlite3.connect('users.db')
+        cursor = conn.cursor()
+        
+        # Convert chunks list to JSON string
+        chunks_json = json.dumps(document_data.get('chunks', []))
+        
+        cursor.execute('''
+            INSERT INTO user_documents (
+                user_id, document_name, document_type, document_content,
+                document_chunks, document_size
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        ''', (
+            user_id, document_data.get('name'), document_data.get('type'),
+            document_data.get('content'), chunks_json, document_data.get('size')
+        ))
+        
+        conn.commit()
+        conn.close()
+        return True
+        
+    except Exception as e:
+        return False
+
+def load_user_documents(user_id: int) -> list:
+    """Load user documents from database"""
+    try:
+        conn = sqlite3.connect('users.db')
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT document_name, document_type, document_content,
+                   document_chunks, document_size, uploaded_at
+            FROM user_documents WHERE user_id = ?
+            ORDER BY uploaded_at DESC
+        ''', (user_id,))
+        
+        documents = []
+        for row in cursor.fetchall():
+            chunks = json.loads(row[3]) if row[3] else []
+            documents.append({
+                'name': row[0],
+                'type': row[1],
+                'content': row[2],
+                'chunks': chunks,
+                'size': row[4],
+                'uploaded_at': row[5]
+            })
+        
+        conn.close()
+        return documents
+        
+    except Exception as e:
+        return []
+
+def save_chat_message(user_id: int, user_message: str, ai_response: str, persona: str = "") -> bool:
+    """Save chat message to database"""
+    try:
+        conn = sqlite3.connect('users.db')
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO user_chat_history (user_id, user_message, ai_response, persona_used)
+            VALUES (?, ?, ?, ?)
+        ''', (user_id, user_message, ai_response, persona))
+        
+        conn.commit()
+        conn.close()
+        return True
+        
+    except Exception as e:
+        return False
+
+def load_chat_history(user_id: int, limit: int = 50) -> list:
+    """Load user chat history from database"""
+    try:
+        conn = sqlite3.connect('users.db')
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT user_message, ai_response, persona_used, timestamp
+            FROM user_chat_history 
+            WHERE user_id = ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+        ''', (user_id, limit))
+        
+        chat_history = []
+        for row in cursor.fetchall():
+            chat_history.append({
+                'prompt': row[0],  # Map to expected key
+                'response': row[1],  # Map to expected key
+                'persona': row[2] or 'Nutritionist',  # Map to expected key with default
+                'timestamp': row[3],
+                'has_image': False,  # Default for loaded chats
+                'request_type': 'text'  # Default for loaded chats
+            })
+        
+        conn.close()
+        return list(reversed(chat_history))  # Reverse to show oldest first
+        
+    except Exception as e:
+        return []
+
+def save_meal_log(user_id: int, meal_data: dict) -> bool:
+    """Save meal log to database"""
+    try:
+        conn = sqlite3.connect('users.db')
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO user_meal_logs (
+                user_id, meal_description, meal_type, calories, protein, carbs, fat
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            user_id, meal_data.get('description', ''), meal_data.get('type', ''),
+            meal_data.get('calories'), meal_data.get('protein'),
+            meal_data.get('carbs'), meal_data.get('fat')
+        ))
+        
+        conn.commit()
+        conn.close()
+        return True
+        
+    except Exception as e:
+        return False
+
+def load_meal_logs(user_id: int, limit: int = 100) -> list:
+    """Load user meal logs from database"""
+    try:
+        conn = sqlite3.connect('users.db')
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT meal_description, meal_type, calories, protein, carbs, fat, logged_at
+            FROM user_meal_logs 
+            WHERE user_id = ?
+            ORDER BY logged_at DESC
+            LIMIT ?
+        ''', (user_id, limit))
+        
+        meal_logs = []
+        for row in cursor.fetchall():
+            meal_logs.append({
+                'description': row[0],
+                'type': row[1],
+                'calories': row[2],
+                'protein': row[3],
+                'carbs': row[4],
+                'fat': row[5],
+                'logged_at': row[6]
+            })
+        
+        conn.close()
+        return meal_logs
+        
+    except Exception as e:
+        return []
+
+# Initialize database on app start
+init_database()
 
 # Page configuration
 st.set_page_config(
@@ -1526,6 +2046,17 @@ def configure_gemini():
             st.stop()
         
         genai.configure(api_key=api_key)
+        
+        # Test API connection
+        try:
+            model = genai.GenerativeModel('gemini-1.5-flash')
+            test_response = model.generate_content("Hello")
+            return True
+        except Exception as api_error:
+            st.error(f"🔍 Google API Error: {str(api_error)}")
+            st.error("❌ Failed to connect to Google Gemini API. Please check your API key.")
+            return False
+        
         return True
     except Exception as e:
         st.error(f"❌ Failed to configure Gemini API: {str(e)}")
@@ -1543,15 +2074,19 @@ def initialize_session_state():
         st.session_state.user_recipe_list = []
     if 'user_profile' not in st.session_state:
         st.session_state.user_profile = {
-            'age': None,
-            'gender': None,
-            'weight': None,
-            'height': None,
-            'activity_level': None,
-            'goal': None,
-            'allergies': '',
-            'health_issues': '',
+            'age': 25,
+            'gender': 'Female',
+            'weight': 65.0,
+            'height': 165.0,
+            'activity_level': 'Moderate',
+            'goal': 'Maintain',
             'goal_duration': 4,
+            'selected_allergies': [],
+            'custom_allergies': '',
+            'food_restrictions': '',
+            'health_issues': '',
+            'is_picky_eater': 'No',
+            'disliked_foods': '',
             'unpreferred_foods': [],
             'profile_complete': False
         }
@@ -2129,6 +2664,12 @@ def process_nutrition_request(prompt_to_use, uploaded_image_data, selected_perso
             "request_type": request_type
         }
         st.session_state.chat_history.append(flagged_chat_entry)
+        
+        # Save to database if user is logged in
+        if 'user_id' in st.session_state and st.session_state.user_id:
+            save_chat_message(st.session_state.user_id, flagged_chat_entry['prompt'], 
+                            flagged_chat_entry['response'], flagged_chat_entry['persona'])
+        
         st.success(f"💾 Chat saved! Total conversations: {len(st.session_state.chat_history)}")
         return
     
@@ -2473,6 +3014,11 @@ def process_nutrition_request(prompt_to_use, uploaded_image_data, selected_perso
         }
         st.session_state.chat_history.append(chat_entry)
         
+        # Save to database if user is logged in
+        if 'user_id' in st.session_state and st.session_state.user_id:
+            save_chat_message(st.session_state.user_id, chat_entry['prompt'], 
+                            chat_entry['response'], chat_entry['persona'])
+        
         # Debug info for chat saving
         st.success(f"💾 Chat saved! Total conversations: {len(st.session_state.chat_history)}")
         
@@ -2490,6 +3036,19 @@ def process_nutrition_request(prompt_to_use, uploaded_image_data, selected_perso
                 "ai_advice": final_response[:200] + "..." if len(final_response) > 200 else final_response
             }
             st.session_state.meal_log.append(meal_entry)
+            
+            # Save to database if user is logged in
+            if 'user_id' in st.session_state and st.session_state.user_id:
+                meal_data = {
+                    'description': meal_entry['meal'],
+                    'type': 'general',  # Could be enhanced to detect breakfast/lunch/dinner
+                    'calories': extracted_nutrition.get('calories') if extracted_nutrition else None,
+                    'protein': extracted_nutrition.get('protein') if extracted_nutrition else None,
+                    'carbs': extracted_nutrition.get('carbs') if extracted_nutrition else None,
+                    'fat': extracted_nutrition.get('fat') if extracted_nutrition else None
+                }
+                save_meal_log(st.session_state.user_id, meal_data)
+            
             st.success(f"🍽️ Meal logged! Total meals tracked: {len(st.session_state.meal_log)}")
         else:
             if enable_meal_logging:
@@ -2522,6 +3081,12 @@ def process_nutrition_request(prompt_to_use, uploaded_image_data, selected_perso
             "request_type": request_type
         }
         st.session_state.chat_history.append(error_chat_entry)
+        
+        # Save to database if user is logged in
+        if 'user_id' in st.session_state and st.session_state.user_id:
+            save_chat_message(st.session_state.user_id, error_chat_entry['prompt'], 
+                            error_chat_entry['response'], error_chat_entry['persona'])
+        
         st.success(f"💾 Chat saved! Total conversations: {len(st.session_state.chat_history)}")
 
 def cravesmart_page():
@@ -2729,7 +3294,10 @@ def main():
         
         max_tokens = st.number_input(
             "Response Length (tokens)",
-            50, 2048, 1024, 50,
+            min_value=50, 
+            max_value=2048, 
+            value=1024, 
+            step=50,
             help="Maximum length of AI responses"
         )
         
@@ -2746,6 +3314,11 @@ def main():
         enable_nutrition_calculator = st.checkbox("🧮 Nutrition Calculator", value=True)
         enable_streaming = False  # Removed real-time responses widget
         enable_meal_logging = st.checkbox("📝 Meal Logging", value=True)
+        
+        # UI Display Options
+        st.subheader("📊 UI Display Options")
+        enable_profile_setup = st.checkbox("👤 Show Profile Setup", value=True, help="Show profile setup button and functionality")
+        enable_meal_logging_display = st.checkbox("📝 Show Meal Log Display", value=True, help="Show meal logging section in main interface")
         
         # TTS feature removed
         
@@ -2785,6 +3358,52 @@ def main():
         
         # Safety Settings (removed user configuration)
         safety_level = "Standard"  # Fixed safety level
+    
+    # Navigation Buttons
+    st.markdown("---")
+    nav_col1, nav_col2 = st.columns([1, 1])
+    
+    with nav_col1:
+        # Profile Setup button - redirects to login if not authenticated
+        if st.button("👤 Complete Profile Setup", use_container_width=True):
+            if 'user_id' in st.session_state and st.session_state.user_id:
+                st.session_state.current_page = "profile_setup"
+            else:
+                st.session_state.current_page = "login"
+            st.rerun()
+    
+    with nav_col2:
+        # Interact with Salma AI button (copied from main page)
+        st.markdown("""
+        <div style="text-align: center;">
+            <a href="https://labs.heygen.com/guest/streaming-embed?share=eyJxdWFsaXR5IjoiaGlnaCIsImF2YXRhck5hbWUiOiJBbGVzc2FuZHJhX0NoYWlyX1NpdHRpbmdf%0D%0AcHVibGljIiwicHJldmlld0ltZyI6Imh0dHBzOi8vZmlsZXMyLmhleWdlbi5haS9hdmF0YXIvdjMv%0D%0AODllMDdiODI2ZjFjNGNiMWE1NTQ5MjAxY2RkOGY0ZDZfNTUzMDAvcHJldmlld190YXJnZXQud2Vi%0D%0AcCIsIm5lZWRSZW1vdmVCYWNrZ3JvdW5kIjpmYWxzZSwia25vd2xlZGdlQmFzZUlkIjoiZTQ0MzAw%0D%0AYWY5YWJjNGRlNmJlMjk4MzI5MzVlOTUzZjIiLCJ1c2VybmFtZSI6IjYwOGYyODY0MWE3ODRjZDk5%0D%0ANzZiZjMwNDQ4OGNhNTcxIn0%3D" 
+               target="_blank" 
+               class="fullscreen-link" 
+               style="display: inline-block; padding: 10px 20px; background: linear-gradient(to right, #91f2c4, #0f5a5e); color: white; text-decoration: none; border-radius: 8px; font-weight: bold; width: 100%; text-align: center; box-sizing: border-box;">
+                🤖 Interact with Salma AI
+            </a>
+            <div style="margin-top: 5px; font-size: 0.8em; color: #666;">
+                ✨ For the best experience with Salma's video chat
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    # Initialize current page
+    if 'current_page' not in st.session_state:
+        st.session_state.current_page = "main"
+    
+    # Page routing
+    if st.session_state.current_page == "login":
+        login_page()
+        return
+    elif st.session_state.current_page == "register":
+        register_page()
+        return
+    elif st.session_state.current_page == "profile_setup":
+        profile_setup_page()
+        return
+    
+    st.markdown("---")
     
     # Main interface
     col1, col2 = st.columns([2, 1])
@@ -2920,429 +3539,472 @@ def main():
             st.rerun()
     
     with col2:
-        # User Profile - Required Setup
-        st.subheader("👤 Your Profile")
+        # User Profile - Required Setup (conditional display)
+        if enable_profile_setup:
+            st.subheader("👤 Your Profile")
         
-        # Check if profile is complete
-        profile_complete = check_profile_complete()
-        
-        if not profile_complete:
-            st.error("⚠️ Please complete your profile before using Aafiya AI")
-        
-        with st.expander("Complete Your Profile", expanded=not profile_complete):
-            # Force profile expander styling in ivory mode
-            if st.session_state.get('white_mode', False):
-                st.markdown("""
-                <style>
-                div[data-testid="stExpander"] {
-                    background: #FFFFF0 !important;
-                    border: 1px solid #B8E8D0 !important;
-                    border-radius: 8px !important;
-                }
-                div[data-testid="stExpander"] summary {
-                    background: #FFFFF0 !important;
-                }
-                </style>
-                """, unsafe_allow_html=True)
-            # Age input
-            age_value = st.session_state.user_profile['age'] if st.session_state.user_profile['age'] is not None else 0
-            st.session_state.user_profile['age'] = st.number_input(
-                "Age *", 
-                min_value=0, 
-                max_value=100, 
-                value=age_value,
-                help="Required for personalized nutrition recommendations. Enter your age (14+)",
-                key="age_input"
-            )
+            # Check if profile is complete
+            profile_complete = check_profile_complete()
             
-            # Gender input
-            gender_options = ["Male", "Female"]
-            current_gender = st.session_state.user_profile.get('gender')
+            if not profile_complete:
+                st.error("⚠️ Please complete your profile before using Aafiya AI")
             
-            if current_gender in gender_options:
-                gender_index = gender_options.index(current_gender) + 1  # +1 because of "Select Gender" at index 0
-            else:
-                gender_index = 0
-            
-            selected_gender = st.selectbox(
-                "Gender *",
-                ["Select Gender"] + gender_options,
-                index=gender_index,
-                help="Required for accurate calorie and nutrition calculations",
-                key="gender_select"
-            )
-            
-            if selected_gender != "Select Gender":
-                st.session_state.user_profile['gender'] = selected_gender
-            else:
-                st.session_state.user_profile['gender'] = None
-            
-            # Weight input
-            weight_value = st.session_state.user_profile['weight'] if st.session_state.user_profile['weight'] is not None else 0.0
-            st.session_state.user_profile['weight'] = st.number_input(
-                "Weight (kg) *", 
-                min_value=0.0, 
-                max_value=200.0, 
-                value=weight_value,
-                step=0.1,
-                help="Current body weight in kilograms. Enter your weight",
-                key="weight_input"
-            )
-            
-            # Height input
-            height_value = st.session_state.user_profile['height'] if st.session_state.user_profile['height'] is not None else 0
-            st.session_state.user_profile['height'] = st.number_input(
-                "Height (cm) *", 
-                min_value=0, 
-                max_value=220, 
-                value=height_value,
-                help="Height in centimeters. Enter your height",
-                key="height_input"
-            )
-            
-            # Activity Level
-            activity_options = ["inactive", "light", "moderate", "active", "very active"]
-            activity_labels = ["Inactive", "Light", "Moderate", "Active", "Very Active"]
-            activity_index = 0 if st.session_state.user_profile['activity_level'] is None else activity_options.index(st.session_state.user_profile['activity_level'])
-            selected_activity = st.selectbox(
-                "Activity Level *",
-                activity_labels,
-                index=activity_index,
-                help="How active are you throughout the week?",
-                key="activity_select"
-            )
-            st.session_state.user_profile['activity_level'] = activity_options[activity_labels.index(selected_activity)]
-            
-            # Goal
-            goal_options = ["lose weight", "maintain", "gain weight", "build muscle"]
-            goal_labels = ["Lose Weight", "Maintain", "Gain Weight", "Build Muscle"]
-            goal_index = 1 if st.session_state.user_profile['goal'] is None else goal_options.index(st.session_state.user_profile['goal'])
-            selected_goal = st.selectbox(
-                "Primary Goal *",
-                goal_labels,
-                index=goal_index,
-                help="What is your main health/fitness goal?",
-                key="goal_select"
-            )
-            st.session_state.user_profile['goal'] = goal_options[goal_labels.index(selected_goal)]
-            
-            # Optional: Goal Duration (in weeks)
-            st.session_state.user_profile['goal_duration'] = st.number_input(
-                "Goal Duration (weeks) - Optional",
-                min_value=4,
-                max_value=52,
-                value=st.session_state.user_profile.get('goal_duration', 4),
-                help="How many weeks do you want to work towards this goal? (minimum 4 weeks)",
-                key="goal_duration_input"
-            )
-            
-            # Optional: Allergies & Intolerances
-            st.markdown("🥗 **Food Allergies & Intolerances**")
-            
-            # Default list of common allergies and sensitivities
-            allergy_list = [
-                "Lactose Intolerant",
-                "Gluten Sensitivity", 
-                "Fructose Intolerance",
-                "Eggs",
-                "Fish",
-                "Shellfish",
-                "Nuts",
-                "Peanuts",
-                "Wheat",
-                "Soy",
-                "Sesame",
-                "Honey"
-            ]
-            
-            # Initialize session state for allergies if not exists
-            if 'user_allergies' not in st.session_state:
-                st.session_state.user_allergies = []
-            
-            # Multiselect for known allergies
-            selected_allergies = st.multiselect(
-                "Select your known allergies or food sensitivities:",
-                options=allergy_list,
-                default=st.session_state.user_allergies,
-                key="allergies_multiselect"
-            )
-            
-            # Add custom allergy functionality
-            col1, col2 = st.columns([4, 1])
-            with col1:
-                custom_allergy = st.text_input(
-                    "Add a custom allergy:",
-                    placeholder="Enter custom allergy/intolerance",
-                    key="custom_allergy_input"
-                )
-            with col2:
-                st.markdown("<div style='margin-top: 8px;'></div>", unsafe_allow_html=True)  # Add spacing
-                add_custom = st.button(
-                    "Add", 
-                    key="add_allergy_btn",
-                    help="Add custom allergy to your list"
-                )
-                
-                # ULTIMATE FORCE Add button styling - IVORY MODE ONLY
+            with st.expander("Complete Your Profile", expanded=not profile_complete):
+                # Force profile expander styling in ivory mode
                 if st.session_state.get('white_mode', False):
                     st.markdown("""
                     <style>
-                    /* Target ALL possible button selectors */
-                    button[key="add_allergy_btn"],
-                    div[data-testid="column"] button,
-                    .stButton > button,
-                    div.stButton button,
-                    [data-testid="stButton"] button,
-                    div[data-testid="stColumn"] button {
-                        background: #B8E8D0 !important;
-                        background-color: #B8E8D0 !important;
-                        color: #0f5a5e !important;
-                        margin-top: 14px !important;
-                        font-size: 0.8rem !important;
-                        padding: 0.25rem 0.5rem !important;
-                        border: none !important;
-                        border-radius: 6px !important;
-                        height: auto !important;
-                        min-height: 32px !important;
+                    div[data-testid="stExpander"] {
+                        background: #FFFFF0 !important;
+                        border: 1px solid #B8E8D0 !important;
+                        border-radius: 8px !important;
+                    }
+                    div[data-testid="stExpander"] summary {
+                        background: #FFFFF0 !important;
                     }
                     </style>
-                    <script>
-                    // Multiple attempts to style the button
-                    function styleAddButton() {
-                        // Try multiple selectors
-                        const selectors = [
-                            'button[key="add_allergy_btn"]',
-                            'button:contains("Add")',
-                            'div[data-testid="stColumn"] button',
-                            '.stButton button',
-                            'button'
-                        ];
-                        
-                        selectors.forEach(selector => {
-                            try {
-                                const buttons = document.querySelectorAll(selector);
-                                buttons.forEach(button => {
-                                    if (button.textContent.includes('Add') || button.getAttribute('key') === 'add_allergy_btn') {
-                                        button.style.setProperty('background', '#B8E8D0', 'important');
-                                        button.style.setProperty('background-color', '#B8E8D0', 'important');
-                                        button.style.setProperty('color', '#0f5a5e', 'important');
-                                        button.style.setProperty('margin-top', '14px', 'important');
-                                        button.style.setProperty('font-size', '0.8rem', 'important');
-                                        button.style.setProperty('padding', '0.25rem 0.5rem', 'important');
-                                        button.style.setProperty('border', 'none', 'important');
-                                        button.style.setProperty('border-radius', '6px', 'important');
-                                    }
-                                });
-                            } catch(e) {}
-                        });
-                    }
-                    
-                    // Run immediately and then repeatedly
-                    styleAddButton();
-                    setTimeout(styleAddButton, 100);
-                    setTimeout(styleAddButton, 500);
-                    setTimeout(styleAddButton, 1000);
-                    
-                    // Also run on any DOM changes
-                    const observer = new MutationObserver(styleAddButton);
-                    observer.observe(document.body, { childList: true, subtree: true });
-                    </script>
                     """, unsafe_allow_html=True)
-            
-            # Handle adding custom allergy
-            if add_custom and custom_allergy:
-                if custom_allergy not in selected_allergies and len(selected_allergies) < len(allergy_list):
-                    selected_allergies.append(custom_allergy)
-                    st.success(f"✅ Added '{custom_allergy}' to your list!")
-                    st.session_state.custom_allergy_input = ""  # Clear input
-                elif len(selected_allergies) >= len(allergy_list):
-                    st.warning(f"⚠️ Maximum {len(allergy_list)} allergies allowed")
-                elif custom_allergy in selected_allergies:
-                    st.info("ℹ️ This allergy is already in your list")
-            
-            # Note: Users can remove allergies directly from the multiselect above
-            
-            # Update session state and user profile
-            st.session_state.user_allergies = selected_allergies
-            st.session_state.user_profile['allergies'] = ', '.join(selected_allergies) if selected_allergies else ''
-            
-            # Display current allergies
-            if selected_allergies:
-                st.success(f"**Current allergies:** {', '.join(selected_allergies)}")
-                st.info(f"📋 Total: {len(selected_allergies)}/{len(allergy_list)} allergies selected")
-            else:
-                st.info("No allergies selected")
-            
-            # Optional: Health Issues
-            st.session_state.user_profile['health_issues'] = st.text_input(
-                "Health Issues - Optional",
-                value=st.session_state.user_profile.get('health_issues', ''),
-                placeholder="e.g., diabetes, high blood pressure, heart disease",
-                help="Any health conditions that affect your diet",
-                key="health_issues_input"
-            )
-            
-            # Optional: Unpreferred Foods (Picky Eater)  
-            # Handle conversion from list to string for text input
-            current_unpreferred = st.session_state.user_profile.get('unpreferred_foods', [])
-            if isinstance(current_unpreferred, list):
-                current_unpreferred_str = ', '.join(current_unpreferred)
-            else:
-                current_unpreferred_str = current_unpreferred
-                
-            unpreferred_input = st.text_area(
-                "Are you a picky eater? (Optional)",
-                value=current_unpreferred_str,
-                placeholder="e.g., broccoli, spicy food, fish, mushrooms, onions",
-                help="List any foods you prefer to avoid, separated by commas",
-                key="unpreferred_foods_input",
-                height=80
-            )
-            
-            # Convert back to list and store
-            if unpreferred_input.strip():
-                st.session_state.user_profile['unpreferred_foods'] = [item.strip() for item in unpreferred_input.split(',') if item.strip()]
-            else:
-                st.session_state.user_profile['unpreferred_foods'] = []
-            
-            # Update profile complete status
-            st.session_state.user_profile['profile_complete'] = check_profile_complete()
-            
-            if st.session_state.user_profile['profile_complete']:
-                st.success("✓ Profile Complete! You can now use Aafiya AI")
-                
-                # Done button to confirm profile completion
-                profile_done_button = st.button(
-                    "✅ Done - Confirm Profile",
-                    type="secondary",
-                    use_container_width=True,
-                    key="profile_done_button"
+                # Age input
+                age_value = st.session_state.user_profile['age'] if st.session_state.user_profile['age'] is not None else 25
+                st.session_state.user_profile['age'] = st.number_input(
+                    "Age *", 
+                    min_value=1, 
+                    max_value=120, 
+                    value=int(age_value),
+                    step=1,
+                    help="Required for personalized nutrition recommendations. Enter your age (14+)",
+                    key="age_input"
                 )
                 
-                if profile_done_button:
-                    st.balloons()
-                    st.success("🎉 Profile confirmed! Welcome to Aafiya AI!")
-                    st.info("You can now start getting personalized nutrition advice below.")
+                # Gender input
+                gender_options = ["Male", "Female"]
+                current_gender = st.session_state.user_profile.get('gender')
                 
-                # Calculate and display BMI with detailed explanation
-                bmi = calculate_bmi(st.session_state.user_profile['weight'], st.session_state.user_profile['height'])
-                
-                # BMI Category classification
-                if bmi < 18.5:
-                    bmi_category = "Underweight"
-                    bmi_color = "blue"
-                    bmi_advice = "Consider consulting a healthcare provider for healthy weight gain strategies."
-                elif 18.5 <= bmi < 25:
-                    bmi_category = "Normal weight"
-                    bmi_color = "green"
-                    bmi_advice = "Great! Maintain your healthy weight with balanced nutrition and regular activity."
-                elif 25 <= bmi < 30:
-                    bmi_category = "Overweight"
-                    bmi_color = "orange"
-                    bmi_advice = "Consider incorporating more physical activity and portion control in your routine."
+                if current_gender in gender_options:
+                    gender_index = gender_options.index(current_gender) + 1  # +1 because of "Select Gender" at index 0
                 else:
-                    bmi_category = "Obese"
-                    bmi_color = "red"
-                    bmi_advice = "Consult with a healthcare provider for a comprehensive weight management plan."
+                    gender_index = 0
                 
-                # Display BMI with detailed information
-                col1, col2 = st.columns([1, 2])
+                selected_gender = st.selectbox(
+                    "Gender *",
+                    ["Select Gender"] + gender_options,
+                    index=gender_index,
+                    help="Required for accurate calorie and nutrition calculations",
+                    key="gender_select"
+                )
+                
+                if selected_gender != "Select Gender":
+                    st.session_state.user_profile['gender'] = selected_gender
+                else:
+                    st.session_state.user_profile['gender'] = None
+                
+                # Weight input
+                weight_value = st.session_state.user_profile['weight'] if st.session_state.user_profile['weight'] is not None else 0.0
+                st.session_state.user_profile['weight'] = st.number_input(
+                    "Weight (kg) *", 
+                    min_value=0.0, 
+                    max_value=200.0, 
+                    value=weight_value,
+                    step=0.1,
+                    help="Current body weight in kilograms. Enter your weight",
+                    key="weight_input"
+                )
+                
+                # Height input
+                height_value = st.session_state.user_profile['height'] if st.session_state.user_profile['height'] is not None else 0.0
+                st.session_state.user_profile['height'] = st.number_input(
+                    "Height (cm) *", 
+                    min_value=0.0, 
+                    max_value=220.0, 
+                    value=height_value,
+                    help="Height in centimeters. Enter your height",
+                    key="height_input"
+                )
+                
+                # Activity Level
+                activity_labels = ["Inactive", "Light", "Moderate", "Active", "Very Active"]
+                current_activity = st.session_state.user_profile.get('activity_level', 'Moderate')
+                
+                # Map old values to new values if needed (same as profile setup)
+                activity_mapping = {
+                    'Sedentary': 'Inactive',
+                    'Lightly Active': 'Light', 
+                    'Moderately Active': 'Moderate',
+                    'Very Active': 'Very Active',
+                    'Extremely Active': 'Very Active',
+                    'inactive': 'Inactive',
+                    'light': 'Light',
+                    'moderate': 'Moderate',
+                    'active': 'Active',
+                    'very active': 'Very Active'
+                }
+                
+                if current_activity in activity_mapping:
+                    current_activity = activity_mapping[current_activity]
+                elif current_activity not in activity_labels:
+                    current_activity = 'Moderate'
+                
+                activity_index = activity_labels.index(current_activity)
+                selected_activity = st.selectbox(
+                    "Activity Level *",
+                    activity_labels,
+                    index=activity_index,
+                    help="How active are you throughout the week?",
+                    key="activity_select"
+                )
+                st.session_state.user_profile['activity_level'] = selected_activity
+                
+                # Goal
+                goal_labels = ["Lose Weight", "Maintain", "Gain Weight", "Build Muscle"]
+                current_goal = st.session_state.user_profile.get('goal', 'Maintain')
+                
+                # Map old values to new values if needed (same as profile setup)
+                goal_mapping = {
+                    'Weight Loss': 'Lose Weight',
+                    'Weight Gain': 'Gain Weight',
+                    'Muscle Building': 'Build Muscle',
+                    'General Health': 'Maintain',
+                    'Athletic Performance': 'Build Muscle',
+                    'lose weight': 'Lose Weight',
+                    'maintain': 'Maintain',
+                    'gain weight': 'Gain Weight',
+                    'build muscle': 'Build Muscle'
+                }
+                
+                if current_goal in goal_mapping:
+                    current_goal = goal_mapping[current_goal]
+                elif current_goal not in goal_labels:
+                    current_goal = 'Maintain'
+                
+                goal_index = goal_labels.index(current_goal)
+                selected_goal = st.selectbox(
+                    "Primary Goal *",
+                    goal_labels,
+                    index=goal_index,
+                    help="What is your main health/fitness goal?",
+                    key="goal_select"
+                )
+                st.session_state.user_profile['goal'] = selected_goal
+                
+                # Optional: Goal Duration (in weeks)
+                st.session_state.user_profile['goal_duration'] = st.number_input(
+                    "Goal Duration (weeks) - Optional",
+                    min_value=4,
+                    max_value=104,
+                    value=int(st.session_state.user_profile.get('goal_duration', 4)),
+                    step=1,
+                    help="How many weeks do you want to work towards this goal? (minimum 4 weeks)",
+                    key="goal_duration_input"
+                )
+                
+                # Optional: Allergies & Intolerances
+                st.markdown("🥗 **Food Allergies & Intolerances**")
+                
+                # Default list of common allergies and sensitivities
+                allergy_list = [
+                    "Lactose Intolerant",
+                    "Gluten Sensitivity", 
+                    "Fructose Intolerance",
+                    "Eggs",
+                    "Fish",
+                    "Shellfish",
+                    "Nuts",
+                    "Peanuts",
+                    "Wheat",
+                    "Soy",
+                    "Sesame",
+                    "Honey"
+                ]
+                
+                # Initialize session state for allergies if not exists
+                if 'user_allergies' not in st.session_state:
+                    st.session_state.user_allergies = []
+                
+                # Multiselect for known allergies
+                selected_allergies = st.multiselect(
+                    "Select your known allergies or food sensitivities:",
+                    options=allergy_list,
+                    default=st.session_state.user_allergies,
+                    key="allergies_multiselect"
+                )
+                
+                # Add custom allergy functionality
+                col1, col2 = st.columns([4, 1])
                 with col1:
-                    st.metric("Your BMI", f"{bmi:.1f}", help="Body Mass Index calculated from your height and weight")
+                    custom_allergy = st.text_input(
+                        "Add a custom allergy:",
+                        placeholder="Enter custom allergy/intolerance",
+                        key="custom_allergy_input"
+                    )
                 with col2:
-                    st.markdown(f"**Category:** :{bmi_color}[{bmi_category}]")
-                
-                with st.expander("📚 Understanding Your BMI"):
-                    st.markdown(f"""
-                    **Your BMI Analysis:**
-                    - **BMI Value:** {bmi:.1f}
-                    - **Category:** {bmi_category}
-                    - **Recommendation:** {bmi_advice}
+                    st.markdown("<div style='margin-top: 8px;'></div>", unsafe_allow_html=True)  # Add spacing
+                    add_custom = st.button(
+                        "Add", 
+                        key="add_allergy_btn",
+                        help="Add custom allergy to your list"
+                    )
                     
-                    **BMI Categories (WHO Standards):**
-                    - Underweight: Below 18.5
-                    - Normal weight: 18.5 - 24.9
-                    - Overweight: 25.0 - 29.9
-                    - Obese: 30.0 and above
-                    
-                    **Important Note:** BMI is a screening tool and doesn't account for muscle mass, bone density, or body composition. For personalized health advice, consult with healthcare professionals.
-                    
-                    **Aafiya AI Integration:** Your BMI and health goals are automatically considered in all nutrition recommendations to provide personalized advice tailored to your needs.
-                    """)
-        
-        # Enhanced Knowledge Base with uploader
-        st.markdown("""
-        <div class="knowledge-base-box">
-            <h3>📚 Aafiya's Knowledge Base</h3>
-            <p><strong>Upload nutrition documents, Please provide your InBody test results (if available), basic body measurements, medical history, current medications or allergies</strong></p>
-        """, unsafe_allow_html=True)
-        
-        # Include uploader inside the box
-        nutrition_documents = nutrition_document_uploader()
-        
-        st.markdown("""
-        </div>
-        """, unsafe_allow_html=True)
-        
-        # 📝 Meal Logging Section
-        st.divider()
-        st.subheader("📝 Your Meal Log")
-        
-        # Initialize meal log if not exists
-        if 'meal_log' not in st.session_state:
-            st.session_state.meal_log = []
-        
-        if st.session_state.meal_log:
-            st.success(f"🍽️ You have logged {len(st.session_state.meal_log)} meals")
-            
-            # Display recent meals in expander
-            with st.expander("View Recent Meals", expanded=False):
-                for i, meal in enumerate(reversed(st.session_state.meal_log[-10:])):
-                    meal_number = len(st.session_state.meal_log) - i
-                    st.markdown(f"**{meal_number}. {meal['food']}**")
-                    st.caption(f"Logged: {meal['time']}")
-                    
-                    # Show nutrition data if available
-                    if meal.get('nutrition'):
-                        nutrition = meal['nutrition']
-                        st.write("**Approximate Nutrition:**")
-                        col1, col2, col3, col4 = st.columns(4)
-                        with col1:
-                            st.metric("Calories", f"~{nutrition.get('calories', 0)}")
-                        with col2:
-                            st.metric("Protein", f"~{nutrition.get('protein', 0)}g")
-                        with col3:
-                            st.metric("Carbs", f"~{nutrition.get('carbs', 0)}g")
-                        with col4:
-                            st.metric("Fat", f"~{nutrition.get('fat', 0)}g")
+                    # ULTIMATE FORCE Add button styling - IVORY MODE ONLY
+                    if st.session_state.get('white_mode', False):
+                        st.markdown("""
+                        <style>
+                        /* Target ALL possible button selectors */
+                        button[key="add_allergy_btn"],
+                        div[data-testid="column"] button,
+                        .stButton > button,
+                        div.stButton button,
+                        [data-testid="stButton"] button,
+                        div[data-testid="stColumn"] button {
+                            background: #B8E8D0 !important;
+                            background-color: #B8E8D0 !important;
+                            color: #0f5a5e !important;
+                            margin-top: 14px !important;
+                            font-size: 0.8rem !important;
+                            padding: 0.25rem 0.5rem !important;
+                            border: none !important;
+                            border-radius: 6px !important;
+                            height: auto !important;
+                            min-height: 32px !important;
+                        }
+                        </style>
+                        <script>
+                        // Multiple attempts to style the button
+                        function styleAddButton() {
+                            // Try multiple selectors
+                            const selectors = [
+                                'button[key="add_allergy_btn"]',
+                                'button:contains("Add")',
+                                'div[data-testid="stColumn"] button',
+                                '.stButton button',
+                                'button'
+                            ];
+                            
+                            selectors.forEach(selector => {
+                                try {
+                                    const buttons = document.querySelectorAll(selector);
+                                    buttons.forEach(button => {
+                                        if (button.textContent.includes('Add') || button.getAttribute('key') === 'add_allergy_btn') {
+                                            button.style.setProperty('background', '#B8E8D0', 'important');
+                                            button.style.setProperty('background-color', '#B8E8D0', 'important');
+                                            button.style.setProperty('color', '#0f5a5e', 'important');
+                                            button.style.setProperty('margin-top', '14px', 'important');
+                                            button.style.setProperty('font-size', '0.8rem', 'important');
+                                            button.style.setProperty('padding', '0.25rem 0.5rem', 'important');
+                                            button.style.setProperty('border', 'none', 'important');
+                                            button.style.setProperty('border-radius', '6px', 'important');
+                                        }
+                                    });
+                                } catch(e) {}
+                            });
+                        }
                         
-                        # Show source information
-                        if nutrition.get('source'):
-                            st.caption(f"Data source: {nutrition['source']}")
+                        // Run immediately and then repeatedly
+                        styleAddButton();
+                        setTimeout(styleAddButton, 100);
+                        setTimeout(styleAddButton, 500);
+                        setTimeout(styleAddButton, 1000);
+                        
+                        // Also run on any DOM changes
+                        const observer = new MutationObserver(styleAddButton);
+                        observer.observe(document.body, { childList: true, subtree: true });
+                        </script>
+                        """, unsafe_allow_html=True)
+                
+                # Handle adding custom allergy
+                if add_custom and custom_allergy:
+                    if custom_allergy not in selected_allergies and len(selected_allergies) < len(allergy_list):
+                        selected_allergies.append(custom_allergy)
+                        st.success(f"✅ Added '{custom_allergy}' to your list!")
+                        st.session_state.custom_allergy_input = ""  # Clear input
+                    elif len(selected_allergies) >= len(allergy_list):
+                        st.warning(f"⚠️ Maximum {len(allergy_list)} allergies allowed")
+                    elif custom_allergy in selected_allergies:
+                        st.info("ℹ️ This allergy is already in your list")
+                
+                # Note: Users can remove allergies directly from the multiselect above
+                
+                # Update session state and user profile
+                st.session_state.user_allergies = selected_allergies
+                st.session_state.user_profile['allergies'] = ', '.join(selected_allergies) if selected_allergies else ''
+                
+                # Display current allergies
+                if selected_allergies:
+                    st.success(f"**Current allergies:** {', '.join(selected_allergies)}")
+                    st.info(f"📋 Total: {len(selected_allergies)}/{len(allergy_list)} allergies selected")
+                else:
+                    st.info("No allergies selected")
+                
+                # Optional: Health Issues
+                st.session_state.user_profile['health_issues'] = st.text_input(
+                    "Health Issues - Optional",
+                    value=st.session_state.user_profile.get('health_issues', ''),
+                    placeholder="e.g., diabetes, high blood pressure, heart disease",
+                    help="Any health conditions that affect your diet",
+                    key="health_issues_input"
+                )
+                
+                # Optional: Unpreferred Foods (Picky Eater)  
+                # Handle conversion from list to string for text input
+                current_unpreferred = st.session_state.user_profile.get('unpreferred_foods', [])
+                if isinstance(current_unpreferred, list):
+                    current_unpreferred_str = ', '.join(current_unpreferred)
+                else:
+                    current_unpreferred_str = current_unpreferred
                     
-                    # Show AI advice if available
-                    if meal.get('ai_advice'):
-                        st.write("**AI Advice:**")
-                        st.info(meal['ai_advice'])
+                unpreferred_input = st.text_area(
+                    "Are you a picky eater? (Optional)",
+                    value=current_unpreferred_str,
+                    placeholder="e.g., broccoli, spicy food, fish, mushrooms, onions",
+                    help="List any foods you prefer to avoid, separated by commas",
+                    key="unpreferred_foods_input",
+                    height=80
+                )
+                
+                # Convert back to list and store
+                if unpreferred_input.strip():
+                    st.session_state.user_profile['unpreferred_foods'] = [item.strip() for item in unpreferred_input.split(',') if item.strip()]
+                else:
+                    st.session_state.user_profile['unpreferred_foods'] = []
+                
+                # Update profile complete status
+                st.session_state.user_profile['profile_complete'] = check_profile_complete()
+                
+                if st.session_state.user_profile['profile_complete']:
+                    st.success("✓ Profile Complete! You can now use Aafiya AI")
                     
-                    # Remove meal button
-                    if st.button(f"🗑️ Remove Meal {meal_number}", key=f"remove_meal_{i}"):
-                        # Find and remove the specific meal
-                        meal_index = len(st.session_state.meal_log) - 1 - i
-                        st.session_state.meal_log.pop(meal_index)
-                        st.success("Meal removed!")
-                        st.rerun()
+                    # Done button to confirm profile completion
+                    profile_done_button = st.button(
+                        "✅ Done - Confirm Profile",
+                        type="secondary",
+                        use_container_width=True,
+                        key="profile_done_button"
+                    )
                     
-                    st.divider()
+                    if profile_done_button:
+                        st.balloons()
+                        st.success("🎉 Profile confirmed! Welcome to Aafiya AI!")
+                        st.info("You can now start getting personalized nutrition advice below.")
+                    
+                    # Calculate and display BMI with detailed explanation
+                    bmi = calculate_bmi(st.session_state.user_profile['weight'], st.session_state.user_profile['height'])
+                    
+                    # BMI Category classification
+                    if bmi < 18.5:
+                        bmi_category = "Underweight"
+                        bmi_color = "blue"
+                        bmi_advice = "Consider consulting a healthcare provider for healthy weight gain strategies."
+                    elif 18.5 <= bmi < 25:
+                        bmi_category = "Normal weight"
+                        bmi_color = "green"
+                        bmi_advice = "Great! Maintain your healthy weight with balanced nutrition and regular activity."
+                    elif 25 <= bmi < 30:
+                        bmi_category = "Overweight"
+                        bmi_color = "orange"
+                        bmi_advice = "Consider incorporating more physical activity and portion control in your routine."
+                    else:
+                        bmi_category = "Obese"
+                        bmi_color = "red"
+                        bmi_advice = "Consult with a healthcare provider for a comprehensive weight management plan."
+                    
+                    # Display BMI with detailed information
+                    col1, col2 = st.columns([1, 2])
+                    with col1:
+                        st.metric("Your BMI", f"{bmi:.1f}", help="Body Mass Index calculated from your height and weight")
+                    with col2:
+                        st.markdown(f"**Category:** :{bmi_color}[{bmi_category}]")
+                    
+                    with st.expander("📚 Understanding Your BMI"):
+                        st.markdown(f"""
+                        **Your BMI Analysis:**
+                        - **BMI Value:** {bmi:.1f}
+                        - **Category:** {bmi_category}
+                        - **Recommendation:** {bmi_advice}
+                        
+                        **BMI Categories (WHO Standards):**
+                        - Underweight: Below 18.5
+                        - Normal weight: 18.5 - 24.9
+                        - Overweight: 25.0 - 29.9
+                        - Obese: 30.0 and above
+                        
+                        **Important Note:** BMI is a screening tool and doesn't account for muscle mass, bone density, or body composition. For personalized health advice, consult with healthcare professionals.
+                        
+                        **Aafiya AI Integration:** Your BMI and health goals are automatically considered in all nutrition recommendations to provide personalized advice tailored to your needs.
+                        """)
+            
+            # Enhanced Knowledge Base with uploader
+            st.markdown("""
+            <div class="knowledge-base-box">
+                <h3>📚 Aafiya's Knowledge Base</h3>
+                <p><strong>Upload nutrition documents, Please provide your InBody test results (if available), basic body measurements, medical history, current medications or allergies</strong></p>
+            """, unsafe_allow_html=True)
+            
+            # Include uploader inside the box
+            nutrition_documents = nutrition_document_uploader()
+            
+            st.markdown("""
+            </div>
+            """, unsafe_allow_html=True)
+        
+        # 📝 Meal Logging Section (conditional display)
+        if enable_meal_logging_display:
+            st.divider()
+            st.subheader("📝 Your Meal Log")
+        
+            # Initialize meal log if not exists
+            if 'meal_log' not in st.session_state:
+                st.session_state.meal_log = []
+            
+            if st.session_state.meal_log:
+                st.success(f"🍽️ You have logged {len(st.session_state.meal_log)} meals")
+                
+                # Display recent meals in expander
+                with st.expander("View Recent Meals", expanded=False):
+                    for i, meal in enumerate(reversed(st.session_state.meal_log[-10:])):
+                        meal_number = len(st.session_state.meal_log) - i
+                        st.markdown(f"**{meal_number}. {meal['food']}**")
+                        st.caption(f"Logged: {meal['time']}")
+                        
+                        # Show nutrition data if available
+                        if meal.get('nutrition'):
+                            nutrition = meal['nutrition']
+                            st.write("**Approximate Nutrition:**")
+                            col1, col2, col3, col4 = st.columns(4)
+                            with col1:
+                                st.metric("Calories", f"~{nutrition.get('calories', 0)}")
+                            with col2:
+                                st.metric("Protein", f"~{nutrition.get('protein', 0)}g")
+                            with col3:
+                                st.metric("Carbs", f"~{nutrition.get('carbs', 0)}g")
+                            with col4:
+                                st.metric("Fat", f"~{nutrition.get('fat', 0)}g")
+                            
+                            # Show source information
+                            if nutrition.get('source'):
+                                st.caption(f"Data source: {nutrition['source']}")
+                        
+                        # Show AI advice if available
+                        if meal.get('ai_advice'):
+                            st.write("**AI Advice:**")
+                            st.info(meal['ai_advice'])
+                        
+                        # Remove meal button
+                        if st.button(f"🗑️ Remove Meal {meal_number}", key=f"remove_meal_{i}"):
+                            # Find and remove the specific meal
+                            meal_index = len(st.session_state.meal_log) - 1 - i
+                            st.session_state.meal_log.pop(meal_index)
+                            st.success("Meal removed!")
+                            st.rerun()
+                        
+                        st.divider()
                 
                 # Clear all meals button
                 if st.button("🗑️ Clear All Meals", key="clear_all_meals"):
                     st.session_state.meal_log = []
                     st.success("All meals cleared!")
                     st.rerun()
-        else:
-            st.info("No meals logged yet. Start a food conversation to see your meals here!")
-            st.caption("🍽️ Meals are automatically logged when you discuss food, nutrition, or upload food images")
+            else:
+                st.info("No meals logged yet. Start a food conversation to see your meals here!")
+                st.caption("🍽️ Meals are automatically logged when you discuss food, nutrition, or upload food images")
         
         # Salma Avatar Integration in Right Panel
         if enable_avatar and HEYGEN_AVAILABLE:
@@ -3523,12 +4185,13 @@ def main():
         
         for i, chat in enumerate(reversed(st.session_state.chat_history[-5:])):
             request_type_icon = "📸" if chat.get('has_image') else "💬"
+            persona = chat.get('persona', 'Nutritionist')
             with st.expander(
-                f"{request_type_icon} Chat {len(st.session_state.chat_history) - i} - {chat['persona']}", 
+                f"{request_type_icon} Chat {len(st.session_state.chat_history) - i} - {persona}", 
                 expanded=(i == 0)
             ):
-                st.markdown(f"**🧑 You:** {chat['prompt']}")
-                st.markdown(f"**🤖 Aafiya ({chat['persona']}):** {chat['response']}")
+                st.markdown(f"**🧑 You:** {chat.get('prompt', 'No message')}")
+                st.markdown(f"**🤖 Aafiya ({persona}):** {chat.get('response', 'No response')}")
                 
                 # Show nutrition data if available
                 nutrition_data = chat.get('function_result') or chat.get('nutrition_data')
@@ -3565,6 +4228,359 @@ def main():
         "</div>",
         unsafe_allow_html=True
     )
+
+def profile_setup_page():
+    """Complete Profile Setup Page with Knowledge Base Integration"""
+    
+    # Check if user is logged in
+    if not is_user_logged_in():
+        st.error("🔐 Please log in to access your profile setup.")
+        if st.button("🔐 Go to Login", use_container_width=True):
+            st.session_state.current_page = "login"
+            st.rerun()
+        return
+    
+    # Load user profile from database if not already loaded
+    if 'user_profile' not in st.session_state or not st.session_state.user_profile.get('profile_complete', False):
+        st.session_state.user_profile = load_user_profile(st.session_state.user_id)
+    
+    # Navigation buttons
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("← Back to Main", key="back_from_profile"):
+            st.session_state.current_page = "main"
+            st.rerun()
+    with col2:
+        if st.button("🚪 Logout", key="logout_from_profile"):
+            # Clear user session
+            st.session_state.user_id = None
+            st.session_state.user_name = None
+            st.session_state.user_email = None
+            st.session_state.current_page = "main"
+            st.rerun()
+    
+    st.title(f"👤 Complete Your Aafiya Profile")
+    st.markdown(f"Welcome, **{st.session_state.get('user_name', 'User')}**! Set up your comprehensive health profile and upload your knowledge base documents for personalized nutrition advice.")
+    
+    # Create tabs for profile sections
+    profile_tab, documents_tab = st.tabs(["📋 Personal Profile", "📚 Knowledge Base"])
+    
+    with profile_tab:
+        st.header("Personal Information")
+        
+        # Basic Information
+        col1, col2 = st.columns(2)
+        with col1:
+            age = st.number_input("Age", min_value=1, max_value=120, value=st.session_state.user_profile.get('age', 25))
+            weight = st.number_input("Weight (kg)", min_value=20.0, max_value=300.0, value=float(st.session_state.user_profile.get('weight', 65.0)))
+            height = st.number_input("Height (cm)", min_value=100.0, max_value=250.0, value=float(st.session_state.user_profile.get('height', 165.0)))
+        
+        with col2:
+            gender = st.selectbox("Gender", ["Male", "Female"], index=["Male", "Female"].index(st.session_state.user_profile.get('gender', 'Female')))
+            
+            # Activity level with fallback mapping
+            activity_options = ["Inactive", "Light", "Moderate", "Active", "Very Active"]
+            current_activity = st.session_state.user_profile.get('activity_level', 'Moderate')
+            
+            # Map old values to new values if needed
+            activity_mapping = {
+                'Sedentary': 'Inactive',
+                'Lightly Active': 'Light', 
+                'Moderately Active': 'Moderate',
+                'Very Active': 'Very Active',
+                'Extremely Active': 'Very Active'
+            }
+            
+            if current_activity in activity_mapping:
+                current_activity = activity_mapping[current_activity]
+            elif current_activity not in activity_options:
+                current_activity = 'Moderate'
+                
+            activity_level = st.selectbox("Activity Level", 
+                activity_options,
+                index=activity_options.index(current_activity))
+            
+            # Goal with fallback mapping
+            goal_options = ["Lose Weight", "Maintain", "Gain Weight", "Build Muscle"]
+            current_goal = st.session_state.user_profile.get('goal', 'Maintain')
+            
+            # Map old values to new values if needed
+            goal_mapping = {
+                'Weight Loss': 'Lose Weight',
+                'Weight Gain': 'Gain Weight',
+                'Muscle Building': 'Build Muscle',
+                'General Health': 'Maintain',
+                'Athletic Performance': 'Build Muscle'
+            }
+            
+            if current_goal in goal_mapping:
+                current_goal = goal_mapping[current_goal]
+            elif current_goal not in goal_options:
+                current_goal = 'Maintain'
+                
+            goal = st.selectbox("Primary Goal", 
+                goal_options,
+                index=goal_options.index(current_goal))
+        
+        # Goal Duration
+        goal_duration = st.number_input("Goal Duration (weeks) - Optional", 
+            min_value=4, max_value=104, 
+            value=st.session_state.user_profile.get('goal_duration', 4),
+            help="Set your goal timeframe (minimum 4 weeks)")
+        
+        # BMI Calculator
+        st.header("📊 BMI Calculator")
+        if weight > 0 and height > 0:
+            bmi = calculate_bmi(weight, height)
+            
+            # BMI Category classification
+            if bmi < 18.5:
+                bmi_category = "Underweight"
+                bmi_color = "blue"
+                bmi_advice = "Consider consulting a healthcare provider for healthy weight gain strategies."
+            elif 18.5 <= bmi < 25:
+                bmi_category = "Normal weight"
+                bmi_color = "green"
+                bmi_advice = "Great! Maintain your healthy weight with balanced nutrition and regular activity."
+            elif 25 <= bmi < 30:
+                bmi_category = "Overweight"
+                bmi_color = "orange"
+                bmi_advice = "Consider incorporating more physical activity and portion control in your routine."
+            else:
+                bmi_category = "Obese"
+                bmi_color = "red"
+                bmi_advice = "Consult with a healthcare provider for a comprehensive weight management plan."
+            
+            # Display BMI with detailed information
+            col1, col2 = st.columns([1, 2])
+            with col1:
+                st.metric("Your BMI", f"{bmi:.1f}", help="Body Mass Index calculated from your height and weight")
+            with col2:
+                st.markdown(f"**Category:** :{bmi_color}[{bmi_category}]")
+            
+            with st.expander("📚 Understanding Your BMI"):
+                st.markdown(f"""
+                **Your BMI Analysis:**
+                - **BMI Value:** {bmi:.1f}
+                - **Category:** {bmi_category}
+                - **Recommendation:** {bmi_advice}
+                
+                **BMI Categories (WHO Standards):**
+                - Underweight: Below 18.5
+                - Normal weight: 18.5 - 24.9
+                - Overweight: 25.0 - 29.9
+                - Obese: 30.0 and above
+                
+                **Important Note:** BMI is a screening tool and doesn't account for muscle mass, bone density, or body composition. For personalized health advice, consult with healthcare professionals.
+                
+                **Aafiya AI Integration:** Your BMI and health goals are automatically considered in all nutrition recommendations to provide personalized advice tailored to your needs.
+                """)
+        else:
+            st.info("💡 Enter your weight and height above to calculate your BMI automatically.")
+        
+        # Health Information
+        st.header("Health Information")
+        
+        # Common allergies multiselect
+        common_allergies = [
+            "Milk/Dairy", "Eggs", "Peanuts", "Tree Nuts", "Soy", "Wheat/Gluten", 
+            "Fish", "Shellfish", "Sesame", "Sulfites", "Corn", "Chocolate"
+        ]
+        
+        selected_allergies = st.multiselect(
+            "Select your allergies (up to 12):",
+            common_allergies,
+            default=st.session_state.user_profile.get('selected_allergies', []),
+            max_selections=12,
+            help="Select common allergies that apply to you"
+        )
+        
+        # Custom allergy input
+        custom_allergies = st.text_input(
+            "Custom allergies (separate with commas):",
+            value=st.session_state.user_profile.get('custom_allergies', ''),
+            help="Enter any additional allergies not listed above"
+        )
+        
+        # Food restrictions
+        food_restrictions = st.text_area(
+            "Other Food Restrictions:",
+            value=st.session_state.user_profile.get('food_restrictions', ''),
+            help="List any dietary restrictions (e.g., vegetarian, kosher, halal)"
+        )
+        
+        health_issues = st.text_area("Health Conditions", value=st.session_state.user_profile.get('health_issues', ''), help="Any relevant health conditions or medications")
+        
+        # Food Preferences
+        st.header("Food Preferences")
+        is_picky_eater = st.selectbox("Are you a picky eater?", 
+            ["No", "Somewhat", "Yes"], 
+            index=["No", "Somewhat", "Yes"].index(st.session_state.user_profile.get('is_picky_eater', 'No')))
+        
+        disliked_foods = st.text_area("What foods do you not like?", 
+            value=st.session_state.user_profile.get('disliked_foods', ''), 
+            help="List foods you dislike or prefer to avoid (e.g., mushrooms, seafood, spicy food)")
+        
+        # Save profile button
+        if st.button("💾 Save Profile", use_container_width=True):
+            profile_data = {
+                'age': age,
+                'weight': weight,
+                'height': height,
+                'gender': gender,
+                'activity_level': activity_level,
+                'goal': goal,
+                'goal_duration': goal_duration,
+                'selected_allergies': selected_allergies,
+                'custom_allergies': custom_allergies,
+                'food_restrictions': food_restrictions,
+                'health_issues': health_issues,
+                'is_picky_eater': is_picky_eater,
+                'disliked_foods': disliked_foods
+            }
+            
+            # Update session state
+            st.session_state.user_profile.update(profile_data)
+            
+            # Save to database
+            if save_user_profile(st.session_state.user_id, profile_data):
+                st.success("✅ Profile saved successfully to database!")
+            else:
+                st.error("❌ Failed to save profile to database. Changes saved locally.")
+            
+    with documents_tab:
+        st.header("📚 Your Knowledge Base")
+        st.markdown("Upload your personal health documents for more personalized advice:")
+        
+        # Use the existing document uploader
+        nutrition_documents = nutrition_document_uploader()
+        
+        if nutrition_documents:
+            st.success(f"📄 {len(nutrition_documents)} documents in your knowledge base")
+            
+            # Display document summary
+            with st.expander("📋 View Your Documents"):
+                for doc in nutrition_documents:
+                    st.markdown(f"**📄 {doc['name']}**")
+                    st.caption(f"Type: {doc['type']} | Size: {doc['size']} characters")
+                    st.text(f"Preview: {doc['content'][:100]}...")
+                    st.divider()
+
+def login_page():
+    """Login Page for User Authentication"""
+    
+    # Back to main button
+    if st.button("← Back to Main", key="back_from_login"):
+        st.session_state.current_page = "main"
+        st.rerun()
+    
+    st.title("🔐 Login to Aafiya AI")
+    st.markdown("Welcome back! Please log in to access your personalized nutrition profile.")
+    
+    # Login form
+    with st.form("login_form"):
+        st.subheader("Login to Your Account")
+        
+        email = st.text_input("📧 Email", placeholder="Enter your email address")
+        password = st.text_input("🔒 Password", type="password", placeholder="Enter your password")
+        
+        login_button = st.form_submit_button("🔐 Login", use_container_width=True)
+        
+        if login_button:
+            if not email or not password:
+                st.error("⚠️ Please fill in all fields")
+            else:
+                # Authenticate user
+                success, user_data = authenticate_user(email, password)
+                
+                if success:
+                    # Set session state
+                    st.session_state.user_id = user_data['id']
+                    st.session_state.user_name = user_data['name']
+                    st.session_state.user_email = user_data['email']
+                    
+                    # Load user profile from database
+                    st.session_state.user_profile = load_user_profile(user_data['id'])
+                    
+                    # Load user documents
+                    st.session_state.nutrition_documents = load_user_documents(user_data['id'])
+                    
+                    # Load chat history
+                    st.session_state.chat_history = load_chat_history(user_data['id'])
+                    
+                    # Load meal logs
+                    st.session_state.meal_log = load_meal_logs(user_data['id'])
+                    
+                    st.success(f"✅ Welcome back, {user_data['name']}!")
+                    st.info("🔄 Redirecting to your profile setup...")
+                    
+                    # Redirect to profile setup
+                    st.session_state.current_page = "profile_setup"
+                    st.rerun()
+                else:
+                    st.error("❌ Invalid email or password. Please try again.")
+    
+    # Register option
+    st.markdown("---")
+    st.markdown("**Don't have an account?**")
+    
+    if st.button("📝 Register Here", use_container_width=True):
+        st.session_state.current_page = "register"
+        st.rerun()
+
+def register_page():
+    """Register Page for New User Creation"""
+    
+    # Back to main button
+    if st.button("← Back to Main", key="back_from_register"):
+        st.session_state.current_page = "main"
+        st.rerun()
+    
+    st.title("📝 Register for Aafiya AI")
+    st.markdown("Create your account to get personalized nutrition advice and track your wellness journey.")
+    
+    # Registration form
+    with st.form("register_form"):
+        st.subheader("Create Your Account")
+        
+        name = st.text_input("👤 Full Name", placeholder="Enter your full name")
+        email = st.text_input("📧 Email", placeholder="Enter your email address")
+        password = st.text_input("🔒 Password", type="password", placeholder="Create a password (6-12 characters)")
+        confirm_password = st.text_input("🔒 Confirm Password", type="password", placeholder="Confirm your password")
+        
+        register_button = st.form_submit_button("✅ Done", use_container_width=True)
+        
+        if register_button:
+            # Validation
+            if not name or not email or not password or not confirm_password:
+                st.error("⚠️ Please fill in all fields")
+            elif len(password) < 6 or len(password) > 12:
+                st.error("⚠️ Password must be between 6-12 characters")
+            elif password != confirm_password:
+                st.error("⚠️ Passwords do not match")
+            elif "@" not in email or "." not in email:
+                st.error("⚠️ Please enter a valid email address")
+            else:
+                # Create user
+                success, message = create_user(name, email, password)
+                
+                if success:
+                    st.success("🎉 Account created successfully!")
+                    st.info("🔄 Please log in with your new account...")
+                    
+                    # Redirect to login
+                    st.session_state.current_page = "login"
+                    st.rerun()
+                else:
+                    st.error(f"❌ Registration failed: {message}")
+    
+    # Back to login option
+    st.markdown("---")
+    st.markdown("**Already have an account?**")
+    
+    if st.button("🔐 Login Here", use_container_width=True):
+        st.session_state.current_page = "login"
+        st.rerun()
 
 if __name__ == "__main__":
     main()

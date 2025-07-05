@@ -181,6 +181,13 @@ def nutrition_document_uploader():
                         }
                         
                         st.session_state.nutrition_documents.append(document)
+                        
+                        # Save to database if user is logged in
+                        if 'user_id' in st.session_state and st.session_state.user_id:
+                            # Import the save function from app.py
+                            from app import save_user_document
+                            if save_user_document(st.session_state.user_id, document):
+                                st.success(f"✅ {file.name} saved to your personal knowledge base!")
         
         # Display loaded documents
         st.success(f"📄 {len(st.session_state.nutrition_documents)} documents loaded into Aafiya's knowledge base")
